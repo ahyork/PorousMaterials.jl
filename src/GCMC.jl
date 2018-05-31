@@ -7,6 +7,13 @@ const INSERTION   = Dict([v => k for (k, v) in PROPOSAL_ENCODINGS])["insertion"]
 const DELETION    = Dict([v => k for (k, v) in PROPOSAL_ENCODINGS])["deletion"]
 const TRANSLATION = Dict([v => k for (k, v) in PROPOSAL_ENCODINGS])["translation"]
 
+# constant values to be used if no previous_sim_data is passed to gcmc_simulation
+const START_SIM_DATA = Dict("molecule array" => Molecule[],
+                "system energy" =>PotentialEnergy(0.0, 0.0, 0.0, 0.0),
+                "gcmc stats" => GCMCstats(0.0, 0.0, 0.0,
+                PotentialEnergy(0.0, 0.0, 0.0, 0.0), PotentialEnergy(0.0, 0.0, 0.0, 0.0),
+                0.0))
+
 """
 Data structure to keep track of statistics collected during a grand-canonical Monte Carlo
 simulation.
@@ -24,7 +31,7 @@ type GCMCstats
 
     U::PotentialEnergy
     U²::PotentialEnergy
-    
+
     Un::Float64 # ⟨U n⟩
 end
 
@@ -38,7 +45,7 @@ type MarkovCounts
 end
 
 # TODO move this to MC helpers? but not sure if it will inline. so wait after test with @time
-@inline function potential_energy(molecule_id::Int, 
+@inline function potential_energy(molecule_id::Int,
                                   molecules::Array{Molecule, 1},
                                   framework::Framework,
                                   ljforcefield::LennardJonesForceField,
@@ -63,6 +70,48 @@ end
     return energy
 end
 
+"""
+
+    adsorption_isotherm_results = adsorption_isotherm(framework, temperature,
+                            fugacities, molecule, ljforcefield,
+                            n_burn_cycles=10000, n_sample_cycles=100000,
+                            sample_frequency=25, verbose=false)
+
+Runs a series of Grand-Canonical Monte Carlo simulations to calculate the
+adsorption of the molecule in the given framework as it realtes to fugacity
+(pressures in an ideal gas). By running the same simulation with different
+fugacities, it creates the adsorption isotherm for the molecule in the framework
+at that temperature.
+
+It takes in the same arguments as the gcmc_simulation function, except that
+fugacities are passed as an array. It then uses the pmap function to run the
+different simulations on separate cores.
+
+In order to use pmap it defines a function inside adsorption isotherm that
+takes in a single fugacity and returns the results of gcmc_simulation using the
+constant values passed in and one of the fugacities passed into
+adsorption_isotherm
+
+# Arguments
+- `framework::Framework`: the porous crystal in which we seek to simulate adsorption
+- `temperature::Float64`: temperature of bulk gas phase in equilibrium with adsorbed phase
+    in the porous material. units: Kelvin (K)
+- `fugacities::Array{Float64}`: array of different fugacities that will be used
+    to make the adsorption isotherm. Each fugacity entry represents the bulk
+    gas phase in equilibrium with adsorbed phase in the porous material. Equal
+    to pressure for an ideal gas. units: Pascal (Pa)
+- `molecule::Molecule`: a template of the adsorbate molecule of which we seek to simulate
+    the adsorption
+- `ljforcefield::LennardJonesForceField`: the molecular model used to describe the
+    energetics of the adsorbate-adsorbate and adsorbate-host van der Waals interactions.
+- `n_burn_cycles::Int`: number of cycles to allow the system to reach equilibrium before
+    sampling.
+- `n_sample_cycles::Int`: number of cycles used for sampling
+- `sample_frequency::Int`: during the sampling cycles, sample e.g. the number of adsorbed
+    gas molecules every this number of Markov proposals.
+- `verbose::Bool`: whether or not to print off information during the simulation.
+"""
+
 function adsorption_isotherm(framework::Framework, temperature::Float64,
                         fugacities::Array{Float64}, molecule::Molecule,
                         ljforcefield::LennardJonesForceField;
@@ -83,6 +132,28 @@ function adsorption_isotherm(framework::Framework, temperature::Float64,
 
     # put results in same order as original fugacity
     return results[[find(x -> x==i, ids)[1] for i = 1:length(ids)]]
+end
+
+function history_adsorption_isotherm(framework::Framework, temperature::Float64,
+                        fugacities::Array{Float64}, molecule::Molecule,
+                        ljforcefield::LennardJonesForceField;
+                        n_burn_cycles::Int=10000, n_sample_cycles::Int=100000,
+                        sample_frequency::Int=25, verbose::Bool=false,
+                        previous_sim_data::Dict{String, Any}=START_SIM_DATA)
+    # This function relies on saving the molecules after each simulation, so the
+    #   user is not allowed to change that
+
+    load_sim_data = previous_sim_data
+    results = Array{Dict{String, Any}, 1}
+
+    for fugacity in fugacities
+        new_result, load_sim_data = gcmc_simulation(framework, temperature, fugacity,
+                        molecule, ljforcefield, n_burn_cycles, n_sample_cycles,
+                        sample_frequency, verbose, save_sim_data=true, load_sim_data)
+        results.push!(new_result)
+    end
+
+    return results
 end
 
 
@@ -119,12 +190,14 @@ translation.
 function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::Float64,
                          molecule::Molecule, ljforcefield::LennardJonesForceField;
                          n_burn_cycles::Int=10000, n_sample_cycles::Int=100000,
-                         sample_frequency::Int=25, verbose::Bool=false)
+                         sample_frequency::Int=25, verbose::Bool=false,
+                         save_simulation_data::Bool=false,
+                         previous_sim_data::Dict{String, Any}=START_SIM_DATA)
     if verbose
         pretty_print(molecule.species, framework.name, temperature, fugacity)
     end
-    
-    # replication factors for applying nearest image convention for short-range 
+
+    # replication factors for applying nearest image convention for short-range
     #   interactions
     const repfactors = replication_factors(framework.box, ljforcefield)
     # the simulation box = replicated primitive framework box
@@ -151,16 +224,24 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
     # pre-compute weights on k-vector contributions to long-rage interactions in
     #   Ewald summation for electrostatics
     #   allocate memory for exp^{i * n * k ⋅ r}
-    eparams, kvectors, eikar, eikbr, eikcr = setup_Ewald_sum(sr_cutoff_r, simulation_box, 
+    eparams, kvectors, eikar, eikbr, eikcr = setup_Ewald_sum(sr_cutoff_r, simulation_box,
                         verbose=verbose & (charged_framework || charged_molecules), ϵ=1e-6)
 
+    system_energy = previous_sim_data["system energy"]
+    gcmc_stats = previous_sim_data["gcmc stats"]
+    molecules = previous_sim_data["molecule array"]
+
+    """
     # TODO in adsorption isotherm dump coords from previous pressure and load them in here.
     # only true if starting with 0 molecules
-    system_energy = PotentialEnergy(0.0, 0.0, 0.0, 0.0)
+    system_energy = deepcopy(starting_system_energy) PotentialEnergy(0.0, 0.0, 0.0, 0.0)
     gcmc_stats = GCMCstats(0, 0, 0, PotentialEnergy(0.0, 0.0, 0.0, 0.0),
-                           PotentialEnergy(0.0, 0.0, 0.0, 0.0), 0.0)
+                        PotentialEnergy(0.0, 0.0, 0.0, 0.0), 0.0)
 
+    # allow the user to pass in molecules, and deepcopy the elements into the
+    #   molecules array so that the old molecules will not be adjusted
     molecules = Molecule[]
+    """
 
     markov_counts = MarkovCounts(zeros(Int, length(PROPOSAL_ENCODINGS)),
                                  zeros(Int, length(PROPOSAL_ENCODINGS)))
@@ -179,7 +260,7 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
             insert_molecule!(molecules, simulation_box, molecule_template)
 
             # compute the potential energy of the inserted molecule
-            energy = potential_energy(length(molecules), molecules, framework, ljforcefield, 
+            energy = potential_energy(length(molecules), molecules, framework, ljforcefield,
                                       simulation_box, repfactors, eparams,
                                       kvectors, eikar, eikbr, eikcr, charged_molecules, charged_framework)
 
@@ -199,7 +280,7 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
             molecule_id = rand(1:length(molecules))
 
             # compute the potential energy of the molecule we propose to delete
-            energy = potential_energy(molecule_id, molecules, framework, ljforcefield, 
+            energy = potential_energy(molecule_id, molecules, framework, ljforcefield,
                                       simulation_box, repfactors, eparams,
                                       kvectors, eikar, eikbr, eikcr, charged_molecules, charged_framework)
 
@@ -218,14 +299,14 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
             molecule_id = rand(1:length(molecules))
 
             # energy of the molecule before it was translated
-            energy_old = potential_energy(molecule_id, molecules, framework, ljforcefield, 
+            energy_old = potential_energy(molecule_id, molecules, framework, ljforcefield,
                                       simulation_box, repfactors, eparams,
                                       kvectors, eikar, eikbr, eikcr, charged_molecules, charged_framework)
 
             old_molecule = translate_molecule!(molecules[molecule_id], simulation_box)
 
             # energy of the molecule after it is translated
-            energy_new = potential_energy(molecule_id, molecules, framework, ljforcefield, 
+            energy_new = potential_energy(molecule_id, molecules, framework, ljforcefield,
                                       simulation_box, repfactors, eparams,
                                       kvectors, eikar, eikbr, eikcr, charged_molecules, charged_framework)
 
@@ -270,7 +351,7 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
     system_energy_end.electro_gg = total_electrostatic_potential_energy(molecules,
                                         eparams, kvectors, eikar, eikbr, eikcr)
 
-    # see Energetics_Util.jl for this function, overloaded isapprox to print mismatch 
+    # see Energetics_Util.jl for this function, overloaded isapprox to print mismatch
     if ! isapprox(system_energy, system_energy_end, verbose=true, atol=0.01)
         error("energy incremented improperly")
     end
@@ -288,7 +369,7 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
     results["# sample cycles"] = n_sample_cycles
     results["# burn cycles"] = n_burn_cycles
     results["# samples"] = gcmc_stats.n_samples
-    
+
     # number of adsorbed molecules
     results["⟨N⟩ (molecules)"] = gcmc_stats.n / gcmc_stats.n_samples
     results["⟨N⟩ (molecules/unit cell)"] = results["⟨N⟩ (molecules)"] /
@@ -307,7 +388,7 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
     results["⟨U_gh, electro⟩ (K)"] = gcmc_stats.U.electro_gh / gcmc_stats.n_samples
 
     results["⟨U⟩ (K)"] = sum(gcmc_stats.U) / gcmc_stats.n_samples
-    
+
     results["var(U_gg, vdw)"] = (gcmc_stats.U².vdw_gg / gcmc_stats.n_samples) - results["⟨U_gg, vdw⟩ (K)"] ^ 2
     results["var(U_gh, vdw)"] = (gcmc_stats.U².vdw_gh / gcmc_stats.n_samples) - results["⟨U_gh, vdw⟩ (K)"] ^ 2
     results["var(U_gg, electro)"] = (gcmc_stats.U².electro_gg / gcmc_stats.n_samples) - results["⟨U_gg, electro⟩ (K)"] ^ 2
@@ -326,7 +407,15 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
         print_results(results)
     end
 
-    return results
+    if save_simulation_data
+        end_simulation_data = Dict{String, Any}()
+        end_simulation_data["molecule array"] = molecules
+        end_simulation_data["system energy"] = system_energy
+        end_simulation_data["gcmc stats"] = gcmc_stats
+        return results, end_simulation_data
+    else
+        return results
+    end
 end # gcmc_simulation
 
 """
@@ -341,8 +430,8 @@ function root_save_filename(framework::Framework,
                             n_sample_cycles::Int)
         frameworkname = split(framework.name, ".")[1] # remove file extension
         forcefieldname = split(ljforcefield.name, ".")[1] # remove file extension
-        return @sprintf("gcmc_%s_%s_T%f_fug%f_%s_%dburn_%dsample", frameworkname, 
-                    molecule.species, temperature, fugacity, forcefieldname, 
+        return @sprintf("gcmc_%s_%s_T%f_fug%f_%s_%dburn_%dsample", frameworkname,
+                    molecule.species, temperature, fugacity, forcefieldname,
                     n_burn_cycles, n_sample_cycles)
 end
 
@@ -369,8 +458,8 @@ function print_results(results::Dict)
 
 
     println("")
-    for key in ["⟨N⟩ (molecules)", "var(N)", "⟨N⟩ (molecules/unit cell)", "⟨N⟩ (mmol/g)", 
-                "⟨U_gg, vdw⟩ (K)", "⟨U_gh, vdw⟩ (K)", "⟨U_gg, electro⟩ (K)", 
+    for key in ["⟨N⟩ (molecules)", "var(N)", "⟨N⟩ (molecules/unit cell)", "⟨N⟩ (mmol/g)",
+                "⟨U_gg, vdw⟩ (K)", "⟨U_gh, vdw⟩ (K)", "⟨U_gg, electro⟩ (K)",
                 "⟨U_gh, electro⟩ (K)", "⟨U⟩ (K)"]
         println(key * ": ", results[key]) # for spacing
         if key == "⟨N⟩ (mmol/g)"

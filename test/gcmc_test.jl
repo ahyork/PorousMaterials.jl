@@ -3,7 +3,7 @@
 using CSV
 using DataFrames
 
-ig_tests = false
+ig_tests = true
 xe_in_sbmof1_tests = false
 co2_tests = false
 
@@ -41,7 +41,7 @@ if xe_in_sbmof1_tests
     test_mmol_g = [0.1931, 1.007, 1.4007]
     test_molec_unit_cell = [0.266, 1.388, 1.929]
 
-    results = adsorption_isotherm(sbmof1, 298.0, test_fugacities, molecule, dreiding_forcefield, n_burn_cycles=25000, n_sample_cycles=25000, verbose=true)
+    #results = adsorption_isotherm(sbmof1, 298.0, test_fugacities, molecule, dreiding_forcefield, n_burn_cycles=25000, n_sample_cycles=25000, verbose=true)
 
     for i = 1:length(test_fugacities)
         @test isapprox(results[i]["⟨N⟩ (molecules/unit cell)"], test_molec_unit_cell[i], rtol=0.025)
