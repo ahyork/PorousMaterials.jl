@@ -7,13 +7,6 @@ const INSERTION   = Dict([v => k for (k, v) in PROPOSAL_ENCODINGS])["insertion"]
 const DELETION    = Dict([v => k for (k, v) in PROPOSAL_ENCODINGS])["deletion"]
 const TRANSLATION = Dict([v => k for (k, v) in PROPOSAL_ENCODINGS])["translation"]
 
-# constant values to be used if no previous_sim_data is passed to gcmc_simulation
-const START_SIM_DATA = Dict("molecule array" => Molecule[],
-                "system energy" =>PotentialEnergy(0.0, 0.0, 0.0, 0.0),
-                "gcmc stats" => GCMCstats(0.0, 0.0, 0.0,
-                PotentialEnergy(0.0, 0.0, 0.0, 0.0), PotentialEnergy(0.0, 0.0, 0.0, 0.0),
-                0.0))
-
 """
 Data structure to keep track of statistics collected during a grand-canonical Monte Carlo
 simulation.
@@ -139,18 +132,17 @@ function history_adsorption_isotherm(framework::Framework, temperature::Float64,
                         ljforcefield::LennardJonesForceField;
                         n_burn_cycles::Int=10000, n_sample_cycles::Int=100000,
                         sample_frequency::Int=25, verbose::Bool=false,
-                        previous_sim_data::Dict{String, Any}=START_SIM_DATA)
+                        molecules::Array{Molecule, 1}=Molecule[])
     # This function relies on saving the molecules after each simulation, so the
     #   user is not allowed to change that
-
-    load_sim_data = previous_sim_data
     results = Array{Dict{String, Any}, 1}
 
     for fugacity in fugacities
-        new_result, load_sim_data = gcmc_simulation(framework, temperature, fugacity,
+        result, molecules = gcmc_simulation(framework, temperature, fugacity,
                         molecule, ljforcefield, n_burn_cycles, n_sample_cycles,
-                        sample_frequency, verbose, save_sim_data=true, load_sim_data)
-        results.push!(new_result)
+                        sample_frequency, verbose, load_sim_data,
+                        molecules=molecules)
+        push!(results, result)
     end
 
     return results
@@ -186,13 +178,13 @@ translation.
 - `sample_frequency::Int`: during the sampling cycles, sample e.g. the number of adsorbed
     gas molecules every this number of Markov proposals.
 - `verbose::Bool`: whether or not to print off information during the simulation.
+- `molecules::Array{Molecules, 1}`: a starting configuration of molecules
 """
 function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::Float64,
                          molecule::Molecule, ljforcefield::LennardJonesForceField;
                          n_burn_cycles::Int=10000, n_sample_cycles::Int=100000,
                          sample_frequency::Int=25, verbose::Bool=false,
-                         save_simulation_data::Bool=false,
-                         previous_sim_data::Dict{String, Any}=START_SIM_DATA)
+                         molecules::Array{Molecule, 1}=Molecule[])
     if verbose
         pretty_print(molecule.species, framework.name, temperature, fugacity)
     end
@@ -227,21 +219,23 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
     eparams, kvectors, eikar, eikbr, eikcr = setup_Ewald_sum(sr_cutoff_r, simulation_box,
                         verbose=verbose & (charged_framework || charged_molecules), ϵ=1e-6)
 
-    system_energy = previous_sim_data["system energy"]
-    gcmc_stats = previous_sim_data["gcmc stats"]
-    molecules = previous_sim_data["molecule array"]
-
-    """
-    # TODO in adsorption isotherm dump coords from previous pressure and load them in here.
-    # only true if starting with 0 molecules
-    system_energy = deepcopy(starting_system_energy) PotentialEnergy(0.0, 0.0, 0.0, 0.0)
+    # initialize GCMC statistics
     gcmc_stats = GCMCstats(0, 0, 0, PotentialEnergy(0.0, 0.0, 0.0, 0.0),
-                        PotentialEnergy(0.0, 0.0, 0.0, 0.0), 0.0)
+                           PotentialEnergy(0.0, 0.0, 0.0, 0.0), 0.0)
 
-    # allow the user to pass in molecules, and deepcopy the elements into the
-    #   molecules array so that the old molecules will not be adjusted
-    molecules = Molecule[]
-    """
+    system_energy = PotentialEnergy(0.0, 0.0, 0.0, 0.0)
+    # compute energy of the starting configuration of molecules
+    if length(molecules) != 0
+        # ensure molecule template matches species of starting molecules.
+        assert(all([m.species == molecule_template.species for m in molecules]))
+
+        system_energy.vdw_gh = total_guest_host_vdw_energy(framework, molecules, ljforcefield, repfactors)
+        system_energy.vdw_gg = total_guest_guest_vdw_energy(molecules, ljforcefield, simulation_box)
+        system_energy.electro_gh = total_electrostatic_potential_energy(framework, molecules,
+                                            repfactors, eparams, kvectors, eikar, eikbr, eikcr)
+        system_energy.electro_gg = total_electrostatic_potential_energy(molecules,
+                                            eparams, kvectors, eikar, eikbr, eikcr)
+    end
 
     markov_counts = MarkovCounts(zeros(Int, length(PROPOSAL_ENCODINGS)),
                                  zeros(Int, length(PROPOSAL_ENCODINGS)))
@@ -407,15 +401,7 @@ function gcmc_simulation(framework::Framework, temperature::Float64, fugacity::F
         print_results(results)
     end
 
-    if save_simulation_data
-        end_simulation_data = Dict{String, Any}()
-        end_simulation_data["molecule array"] = molecules
-        end_simulation_data["system energy"] = system_energy
-        end_simulation_data["gcmc stats"] = gcmc_stats
-        return results, end_simulation_data
-    else
-        return results
-    end
+    return results, molecules
 end # gcmc_simulation
 
 """
